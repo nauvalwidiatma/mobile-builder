@@ -1,0 +1,172 @@
+# APK_BUILDER_WORKFLOW_VERSION=3
+name: Android Build
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
+on:
+  workflow_dispatch:
+    inputs:
+      repo_url:
+        description: Source repository URL
+        required: true
+        type: string
+      build_type:
+        description: Build output type
+        required: true
+        type: string
+      runner:
+        description: Runner label requested by panel
+        required: false
+        type: string
+      notes:
+        description: Build notes from panel
+        required: false
+        type: string
+
+jobs:
+  build-android:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Clone source repository
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          repo_url="${{ inputs.repo_url }}"
+          if [ -z "$repo_url" ]; then
+            echo "Input repo_url wajib diisi." >&2
+            exit 1
+          fi
+
+          git clone --depth 1 "$repo_url" source-repo
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Locate Gradle project root
+        id: gradle-root
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cd source-repo
+
+          root=""
+
+          if [ -f "settings.gradle.kts" ] || [ -f "settings.gradle" ] || [ -f "build.gradle.kts" ] || [ -f "build.gradle" ]; then
+            root="."
+          else
+            candidate="$(find . -maxdepth 4 \( -name settings.gradle.kts -o -name settings.gradle \) -print | head -n 1)"
+            if [ -n "$candidate" ]; then
+              root="$(dirname "$candidate")"
+            fi
+          fi
+
+          if [ -z "$root" ]; then
+            echo "Tidak menemukan root Gradle project." >&2
+            find . -maxdepth 4 -type f | sort >&2
+            exit 1
+          fi
+
+          root="${root#./}"
+          if [ -z "$root" ]; then
+            root="."
+          fi
+
+          echo "project_dir=$root" >> "$GITHUB_OUTPUT"
+          echo "Gradle project root: $root"
+
+      - name: Prepare Gradle wrapper if missing
+        shell: bash
+        working-directory: ${{ steps.gradle-root.outputs.project_dir }}
+        run: |
+          set -euo pipefail
+
+          if [ ! -f "./gradlew" ]; then
+            gradle wrapper
+          fi
+
+          chmod +x ./gradlew
+
+      - name: Apply common Android compatibility fixes
+        shell: bash
+        working-directory: ${{ steps.gradle-root.outputs.project_dir }}
+        run: |
+          set -euo pipefail
+
+          manifest="app/src/main/AndroidManifest.xml"
+
+          has_launcher_assets="false"
+          if find app/src/main/res -type f \( -path '*mipmap*/ic_launcher*' -o -path '*mipmap*/ic_launcher_round*' \) | grep -q .; then
+            has_launcher_assets="true"
+          fi
+
+          if [ -f "$manifest" ] && [ "$has_launcher_assets" = "false" ]; then
+            python - <<'PY'
+from pathlib import Path
+
+manifest = Path("app/src/main/AndroidManifest.xml")
+text = manifest.read_text(encoding="utf-8")
+updated = text.replace('@mipmap/ic_launcher_round', '@android:drawable/sym_def_app_icon')
+updated = updated.replace('@mipmap/ic_launcher', '@android:drawable/sym_def_app_icon')
+
+if updated != text:
+    manifest.write_text(updated, encoding="utf-8")
+    print("Launcher icon fallback applied to AndroidManifest.xml")
+else:
+    print("No launcher icon patch needed.")
+PY
+          fi
+
+      - name: Choose build task
+        id: build-task
+        shell: bash
+        working-directory: ${{ steps.gradle-root.outputs.project_dir }}
+        run: |
+          set -euo pipefail
+
+          build_type="${{ inputs.build_type }}"
+          task="./gradlew :app:assembleRelease"
+          artifact_glob="app/build/outputs/apk/release/*.apk"
+          artifact_name="app-release-apk"
+
+          if [ "$build_type" = "debug APK" ]; then
+            task="./gradlew :app:assembleDebug"
+            artifact_glob="app/build/outputs/apk/debug/*.apk"
+            artifact_name="app-debug-apk"
+          fi
+
+          if [ "$build_type" = "AAB" ]; then
+            task="./gradlew :app:bundleRelease"
+            artifact_glob="app/build/outputs/bundle/release/*.aab"
+            artifact_name="app-release-bundle"
+          fi
+
+          echo "task=$task" >> "$GITHUB_OUTPUT"
+          echo "artifact_glob=source-repo/${{ steps.gradle-root.outputs.project_dir }}/$artifact_glob" >> "$GITHUB_OUTPUT"
+          echo "artifact_name=$artifact_name" >> "$GITHUB_OUTPUT"
+
+      - name: Build Android artifact
+        shell: bash
+        working-directory: ${{ steps.gradle-root.outputs.project_dir }}
+        run: ${{ steps.build-task.outputs.task }}
+
+      - name: Upload APK or AAB artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.build-task.outputs.artifact_name }}
+          path: ${{ steps.build-task.outputs.artifact_glob }}
+          if-no-files-found: error
